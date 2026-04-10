@@ -1,47 +1,79 @@
-# Trump Truth Social Monitor v4 🇺🇸
+# Trump Truth Social Monitor v4
 
-這是一個自動化監控 Donald Trump 在 Truth Social 上最新貼文的工具。它使用 Playwright 模擬瀏覽器行為以繞過 Cloudflare 保護，並整合 OpenClaw 進行自動翻譯與 Telegram 發送。
+這個專案會監控 Donald Trump 的 Truth Social 最新貼文，抓到尚未處理的新貼文後，透過 OpenClaw 翻譯成繁體中文，再送到指定的 Telegram 對話。
 
-## 🌟 功能特點
+目前主程式是 [trump_monitor_v4.py](./trump_monitor_v4.py)。
 
-- **規避偵測**：使用 Playwright 模擬真實瀏覽器行為，有效繞過 Cloudflare 驗證。
-- **隨機延遲**：連線前隨機等待 5-30 秒，降低被識別為爬蟲的風險。
-- **精確抓取**：自動擷取貼文內容與發佈時間，並過濾廣告 (Sponsored)。
-- **智能去重**：包含段落級別與內容層級的去重邏輯，防止重複內容。
-- **OpenClaw 整合**：自動呼叫 OpenClaw 將內容翻譯為繁體中文，並直接發送到指定的 Telegram 頻道。
+## 功能
 
-## 🛠 安裝要求
+- 使用 Playwright 抓取 `https://truthsocial.com/@realDonaldTrump`
+- 過濾 `Sponsored` 內容並抽出貼文 ID、時間、正文
+- 用本地記錄檔去重，避免重複處理同一篇貼文
+- 呼叫 `openclaw agent` 進行繁中翻譯
+- 呼叫 `openclaw message send --channel telegram --target ...` 發送到 Telegram
+- 內建 timeout / retry，降低 OpenClaw 偶發卡住造成的失敗率
+- 內建單實例鎖，避免 cron 與手動執行重疊導致重複發送
+
+## 目前實作細節
+
+- 抓取方式：解析頁面 DOM，不是直接打 Truth Social API
+- 已讀 ID 檔案：`/home/jimmy/.openclaw/workspace/memory/trump_last_truth_v4.txt`
+- OpenClaw 路徑：`/home/jimmy/.npm-global/bin/openclaw`
+- Telegram 目標：程式內固定使用 `--target 1032617150`
+- 單實例鎖檔：`/tmp/trump_truth_monitor_v4.lock`
+
+## 安裝需求
 
 - Python 3.8+
 - [Playwright](https://playwright.dev/python/docs/intro)
-- [OpenClaw](https://github.com/82rhvcfjwv-oss/openclaw) (需安裝於全域路徑)
+- 已可正常執行的 [OpenClaw](https://github.com/82rhvcfjwv-oss/openclaw)
 
-## 🚀 快速開始
+安裝 Playwright：
 
-1. **安裝依賴**：
-   ```bash
-   pip install playwright requests
-   playwright install chromium
-   ```
+```bash
+pip install playwright
+playwright install chromium
+```
 
-2. **設定環境變數**（選用，若 OpenClaw 內部已設定則可省略）：
-   ```bash
-   export TELEGRAM_BOT_TOKEN="your_bot_token"
-   export TELEGRAM_CHAT_ID="your_chat_id"
-   ```
+## 執行方式
 
-3. **執行監控**：
-   ```bash
-   python3 trump_monitor_v4.py
-   ```
+手動執行：
 
-## ⚙️ 設定說明
+```bash
+python3 trump_monitor_v4.py
+```
 
-核心設定位於 `trump_monitor_v4.py` 的頂部：
-- `LAST_ID_FILE`: 儲存已讀貼文 ID 的路徑。
-- `OPENCLAW_PATH`: OpenClaw 執行檔的絕對路徑。
-- `TELEGRAM_CHAT_ID`: 目標 Telegram 頻道的 ID。
+若程式偵測到已有另一個執行中的實例，會直接跳過，避免重複發送。
 
-## 📝 授權
+## 目前 cron 排程
+
+這台機器目前有設定每 30 分鐘執行一次：
+
+```cron
+*/30 * * * * /usr/bin/python3 /home/jimmy/.openclaw/workspace/trump-truth-monitor-v4/trump_monitor_v4.py >>/home/jimmy/.openclaw/workspace/cron-results/trump-truth-monitor-v4/run.log 2>&1
+```
+
+## 除錯與排查
+
+最重要的執行紀錄在：
+
+```text
+/home/jimmy/.openclaw/workspace/cron-results/trump-truth-monitor-v4/run.log
+```
+
+常見判讀方式：
+
+- 出現 `沒有新貼文。`：此次抓取正常，但沒有新文
+- 出現 `openclaw 翻譯貼文...` 後失敗：通常是 OpenClaw / 模型端超時或失敗
+- 出現 `送出到 Telegram...`：表示已進入發送階段
+- 出現 `已有另一個 trump_monitor_v4.py 執行中`：代表有重疊執行，這次已被鎖擋下
+
+## 已知限制
+
+- Truth Social 頁面結構或 Cloudflare 行為變動時，抓取可能失效
+- `openclaw message send` 有時會回應很慢，所以目前設定了較長的 send timeout
+- 目前翻譯失敗時不會 fallback 送原文，只會跳過該篇貼文
+
+## 授權
 
 MIT License

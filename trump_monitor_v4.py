@@ -1,11 +1,10 @@
 import asyncio
-import json
+import fcntl
 import os
 import re
-import requests
-import subprocess
-import shlex
 import random
+import subprocess
+import time
 from datetime import datetime
 from playwright.async_api import async_playwright
 
@@ -14,6 +13,12 @@ USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 LAST_ID_FILE = '/home/jimmy/.openclaw/workspace/memory/trump_last_truth_v4.txt'
 OPENCLAW_PATH = '/home/jimmy/.npm-global/bin/openclaw'
 TELEGRAM_CHAT_ID = "1032617150"
+LOCK_FILE = '/tmp/trump_truth_monitor_v4.lock'
+OPENCLAW_TRANSLATE_TIMEOUT = 120
+OPENCLAW_SEND_TIMEOUT = 180
+OPENCLAW_TRANSLATE_RETRIES = 3
+OPENCLAW_SEND_RETRIES = 1
+OPENCLAW_RETRY_DELAY_SECONDS = 5
 
 def clean_content(text):
     """清理並去重貼文內容"""
@@ -149,23 +154,104 @@ def save_ids(ids):
         for pid in sorted(list(ids), reverse=True)[:100]:
             f.write(f"{pid}\n")
 
-def process_with_openclaw(content, timestamp):
-    text_to_process = f"貼文時間：{timestamp}\n貼文內容：{content}"
-    prompt_message = f"請將以下貼文翻譯成繁體中文，只需翻譯貼文正文，不需要翻譯 HTML 標籤與數字，翻譯完後立刻用 message send 發送到 chat id為{TELEGRAM_CHAT_ID}的Telegram頻道：{text_to_process}"
-    
-    cmd = [OPENCLAW_PATH, "agent", "--agent", "main", "--message", prompt_message]
-    
-    print(f"正在透過 openclaw 處理貼文（時間：{timestamp}）...")
+
+def acquire_single_instance_lock():
+    lock_fp = open(LOCK_FILE, 'w')
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        print(f"✅ openclaw 處理完成")
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"❌ openclaw 執行失敗: {e.stderr}")
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_fp.write(str(os.getpid()))
+        lock_fp.flush()
+        return lock_fp
+    except BlockingIOError:
+        lock_fp.close()
+        return None
+
+def build_translation_prompt(content, timestamp):
+    return (
+        "請將以下貼文翻譯成繁體中文，只翻譯正文，保留時間資訊。"
+        f"輸出格式固定如下：\n貼文時間：{timestamp}\n貼文內容：<翻譯後內容>\n\n"
+        f"原文：{content}"
+    )
+
+
+def run_openclaw_command(cmd, action_label, timeout_seconds, retries):
+    for attempt in range(1, retries + 1):
+        print(
+            f"{action_label}（第 {attempt}/{retries} 次，timeout={timeout_seconds}s）..."
+        )
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=timeout_seconds,
+            )
+            stdout = (result.stdout or "").strip()
+            stderr = (result.stderr or "").strip()
+            if stderr:
+                print(stderr)
+            return stdout
+        except subprocess.TimeoutExpired:
+            print(f"❌ {action_label}逾時（>{timeout_seconds}s）")
+        except subprocess.CalledProcessError as e:
+            error_output = (e.stderr or e.stdout or "").strip()
+            print(f"❌ {action_label}失敗: {error_output}")
+        except Exception as e:
+            print(f"❌ {action_label}發生未預期錯誤: {e}")
+
+        if attempt < retries:
+            print(f"{OPENCLAW_RETRY_DELAY_SECONDS} 秒後重試...")
+            time.sleep(OPENCLAW_RETRY_DELAY_SECONDS)
+
+    return None
+
+
+def translate_with_openclaw(content, timestamp):
+    prompt_message = build_translation_prompt(content, timestamp)
+    cmd = [
+        OPENCLAW_PATH,
+        "agent",
+        "--agent",
+        "main",
+        "--message",
+        prompt_message,
+    ]
+
+    return run_openclaw_command(
+        cmd,
+        f"openclaw 翻譯貼文（時間：{timestamp}）",
+        OPENCLAW_TRANSLATE_TIMEOUT,
+        OPENCLAW_TRANSLATE_RETRIES,
+    )
+
+
+def send_to_telegram(message):
+    cmd = [
+        OPENCLAW_PATH,
+        "message",
+        "send",
+        "--channel",
+        "telegram",
+        "--target",
+        TELEGRAM_CHAT_ID,
+        "--message",
+        message,
+    ]
+    result = run_openclaw_command(
+        cmd,
+        "送出到 Telegram",
+        OPENCLAW_SEND_TIMEOUT,
+        OPENCLAW_SEND_RETRIES,
+    )
+    return result is not None
+
+
+def process_with_openclaw(content, timestamp):
+    translated = translate_with_openclaw(content, timestamp)
+    if not translated:
         return False
-    except Exception as e:
-        print(f"❌ 發生未預期錯誤: {e}")
-        return False
+    return send_to_telegram(translated)
 
 async def main():
     posts = await fetch_trump_posts()
@@ -193,4 +279,12 @@ async def main():
     print("更新完成。")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    lock_fp = acquire_single_instance_lock()
+    if lock_fp is None:
+        print("已有另一個 trump_monitor_v4.py 執行中，這次跳過。")
+    else:
+        try:
+            asyncio.run(main())
+        finally:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+            lock_fp.close()
