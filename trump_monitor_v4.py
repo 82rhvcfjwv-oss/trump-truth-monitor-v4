@@ -11,14 +11,16 @@ from playwright.async_api import async_playwright
 # 配置
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 LAST_ID_FILE = '/home/jimmy/.openclaw/workspace/memory/trump_last_truth_v4.txt'
-OPENCLAW_PATH = '/home/jimmy/.npm-global/bin/openclaw'
+HERMES_PATH = '/home/jimmy/.local/bin/hermes'
+HERMES_PROVIDER = 'openrouter'
+HERMES_MODEL = 'google/gemma-4-31b-it:free'
 TELEGRAM_CHAT_ID = "1032617150"
 LOCK_FILE = '/tmp/trump_truth_monitor_v4.lock'
-OPENCLAW_TRANSLATE_TIMEOUT = 120
-OPENCLAW_SEND_TIMEOUT = 180
-OPENCLAW_TRANSLATE_RETRIES = 3
-OPENCLAW_SEND_RETRIES = 1
-OPENCLAW_RETRY_DELAY_SECONDS = 5
+HERMES_TRANSLATE_TIMEOUT = 120
+HERMES_SEND_TIMEOUT = 300
+HERMES_TRANSLATE_RETRIES = 3
+HERMES_SEND_RETRIES = 3
+HERMES_RETRY_DELAY_SECONDS = 5
 
 def clean_content(text):
     """清理並去重貼文內容"""
@@ -174,7 +176,7 @@ def build_translation_prompt(content, timestamp):
     )
 
 
-def run_openclaw_command(cmd, action_label, timeout_seconds, retries):
+def run_hermes_command(cmd, action_label, timeout_seconds, retries):
     for attempt in range(1, retries + 1):
         print(
             f"{action_label}（第 {attempt}/{retries} 次，timeout={timeout_seconds}s）..."
@@ -201,54 +203,78 @@ def run_openclaw_command(cmd, action_label, timeout_seconds, retries):
             print(f"❌ {action_label}發生未預期錯誤: {e}")
 
         if attempt < retries:
-            print(f"{OPENCLAW_RETRY_DELAY_SECONDS} 秒後重試...")
-            time.sleep(OPENCLAW_RETRY_DELAY_SECONDS)
+            print(f"{HERMES_RETRY_DELAY_SECONDS} 秒後重試...")
+            time.sleep(HERMES_RETRY_DELAY_SECONDS)
 
     return None
 
 
-def translate_with_openclaw(content, timestamp):
+def normalize_hermes_output(output):
+    if not output:
+        return ""
+    lines = output.strip().splitlines()
+    cleaned = []
+    for line in lines:
+        if line.strip().startswith("session_id:"):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip()
+
+
+def translate_with_hermes(content, timestamp):
     prompt_message = build_translation_prompt(content, timestamp)
     cmd = [
-        OPENCLAW_PATH,
-        "agent",
-        "--agent",
-        "main",
-        "--message",
+        HERMES_PATH,
+        "chat",
+        "-Q",
+        "-q",
+        "--provider",
+        HERMES_PROVIDER,
+        "--model",
+        HERMES_MODEL,
         prompt_message,
     ]
 
-    return run_openclaw_command(
+    translated = run_hermes_command(
         cmd,
-        f"openclaw 翻譯貼文（時間：{timestamp}）",
-        OPENCLAW_TRANSLATE_TIMEOUT,
-        OPENCLAW_TRANSLATE_RETRIES,
+        f"hermes 翻譯貼文（時間：{timestamp}）",
+        HERMES_TRANSLATE_TIMEOUT,
+        HERMES_TRANSLATE_RETRIES,
     )
+    return normalize_hermes_output(translated)
 
 
 def send_to_telegram(message):
-    cmd = [
-        OPENCLAW_PATH,
-        "message",
-        "send",
-        "--channel",
-        "telegram",
-        "--target",
-        TELEGRAM_CHAT_ID,
-        "--message",
-        message,
-    ]
-    result = run_openclaw_command(
-        cmd,
-        "送出到 Telegram",
-        OPENCLAW_SEND_TIMEOUT,
-        OPENCLAW_SEND_RETRIES,
+    send_prompt = (
+        "請使用 send_message 工具把以下訊息發送到 Telegram。"
+        f"target 請使用 {TELEGRAM_CHAT_ID}。"
+        "發送成功只回覆 SENT，失敗回覆 ERROR。\n\n"
+        f"訊息內容：\n{message}"
     )
-    return result is not None
+    cmd = [
+        HERMES_PATH,
+        "chat",
+        "-Q",
+        "-q",
+        "--provider",
+        HERMES_PROVIDER,
+        "--model",
+        HERMES_MODEL,
+        send_prompt,
+    ]
+    result = run_hermes_command(
+        cmd,
+        "透過 hermes 送出到 Telegram",
+        HERMES_SEND_TIMEOUT,
+        HERMES_SEND_RETRIES,
+    )
+    normalized = normalize_hermes_output(result)
+    # 寬鬆匹配：只要包含 SENT 或 成功-send 類關鍵字即可
+    return bool(normalized) and any(keyword in normalized.upper() for keyword in ["SENT", "成功", "SUCCESS"])
 
 
-def process_with_openclaw(content, timestamp):
-    translated = translate_with_openclaw(content, timestamp)
+def process_with_hermes(content, timestamp):
+    translated = translate_with_hermes(content, timestamp)
     if not translated:
         return False
     return send_to_telegram(translated)
@@ -269,7 +295,7 @@ async def main():
     print(f"發現 {len(new_posts)} 條新貼文！")
     
     for post in reversed(new_posts): # 從舊到新處理
-        success = process_with_openclaw(post['content'], post['timestamp'])
+        success = process_with_hermes(post['content'], post['timestamp'])
         if success:
             last_ids.add(post['id'])
         else:
